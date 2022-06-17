@@ -3,6 +3,7 @@ import contextlib
 import copy
 import functools
 import itertools
+import logging
 import math
 import traceback
 import warnings
@@ -96,6 +97,7 @@ FSDP_PREFIX = FSDP_WRAPPED_MODULE + "." + FPW_MODULE + "."
 
 _PARAM_BROADCAST_BUCKET_SIZE = int(250 * 1024 * 1024)
 
+logger = logging.getLogger(__name__)
 
 def _default_meta_device_init_fn(module):
     """
@@ -2897,7 +2899,7 @@ class FullyShardedDataParallel(nn.Module):
                     # reduce_dtype matches the param dtype.
                     param.grad.data = param.grad.data.to(self.mixed_precision.reduce_dtype)
 
-                if self.gradient_predivide_factor > 1:
+                if self.gradient_predivide_factor > 1 and self.sharding_strategy != ShardingStrategy.NO_SHARD:
                     # Average grad by world_size for consistency with PyTorch DDP.
                     param.grad.div_(self.gradient_predivide_factor)
 
@@ -2974,10 +2976,20 @@ class FullyShardedDataParallel(nn.Module):
                     ), "Currently the way for _is_sharded to be False is \
                         world_size == 1 or sharding_stratagy is set to be NO_SHARD"
                     if self.sharding_strategy == ShardingStrategy.NO_SHARD:
-                        dist.all_reduce(param.grad, group=self.process_group)
-                        if self.gradient_postdivide_factor > 1:
-                            # Average grad by world_size for consistency with PyTorch DDP.
-                            param.grad.div_(self.gradient_postdivide_factor)
+                        # if a communication hook was registered,
+                        # then a model has attribute ``communication_hook``
+                        if hasattr(self, "communication_hook"):
+                            self.communication_hook(self.communication_hook_state, param.grad)
+                        else:
+                            # we skipped predivide earlier for NO_SHARD
+                            # this is a no-hook case, so need to predivide grads
+                            if self.gradient_predivide_factor > 1:
+                                param.grad.div_(self.gradient_predivide_factor)
+                            dist.all_reduce(param.grad, group=self.process_group)
+                            if self.gradient_postdivide_factor > 1:
+                                # Average grad by world_size for consistency with PyTorch DDP.
+                                param.grad.div_(self.gradient_postdivide_factor)
+
                     # Note that we need to cast grads back to the full precision if
                     # 1) parameters were in reduced precision during fwd, as grads
                     # would thus be in this reduced precision, or
@@ -3396,6 +3408,54 @@ class FullyShardedDataParallel(nn.Module):
                         f"parameters in `forward()` for {r2_param_names}"
                     )
             eod.param_order.append(param_index)
+
+    def register_comm_hook(self, state: object, hook: callable):
+        r"""
+
+        Registers a communication hook which is an enhancement that provides a
+        flexible hook to users where they can specify how FSDP aggregates gradients
+        across multiple workers.
+
+        This hook can be used to implement several algorithms like GossipGrad
+        and gradient compression which involve different communication strategies for
+        parameter syncs while running Fully Sharded Data Parallel training.
+
+        .. warning::
+            FSDP only support communication hooks for a NO_SHARD strategy at this time.
+            If other strategies are used, an error will be raised.
+
+        Args:
+            state (object): Passed to the hook to maintain any state information during the training process.
+                            Examples include error feedback in gradient compression,
+                            peers to communicate with next in GossipGrad, etc.
+
+                            It is locally stored by each worker
+                            and shared by all the gradient tensors on the worker.
+
+            hook (callable): Callable with the following signature:
+                             ``hook: Callable[torch.Tensor] -> None``:
+
+                             This function takes in a python tensor, which represents a gradient
+                             that needs to be communicated across ranks. It then performs
+                             all neccessary processing and returns nothing.
+
+        """
+        if self.sharding_strategy != ShardingStrategy.NO_SHARD:
+
+            raise RuntimeError(
+                "Communication hooks are currently only available for a NO_SHARD strategy."
+            )
+        else:
+            # register same hook for root and all submodules
+            for submodule in self.fsdp_modules(self):
+                if submodule.check_is_root():
+                    logger.warn(
+                        f"NOTE: {hook.__qualname__} will be shared across all submodules."
+                    )
+                submodule.communication_hook_state = state
+                submodule.communication_hook = hook
+
+
 
     @torch.no_grad()
     def _prep_grads_for_backward(self) -> None:
