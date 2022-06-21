@@ -11,6 +11,7 @@ from torch.fx.graph import (
     Graph,
     Node,
 )
+from torch.fx.node import Argument
 
 from typing import Callable, Optional, List, Dict, Any, Set, Tuple, Union, Type
 from collections import namedtuple
@@ -346,6 +347,8 @@ def collect_producer_nodes(node: Node) -> Optional[List[Node]]:
     frontier = [node]
     while frontier:
         node = frontier.pop()
+        if node is None:
+            return None
         all_args = list(node.args) + list(node.kwargs.values())
         for arg in all_args:
             if not isinstance(arg, Node):
@@ -624,3 +627,37 @@ def create_node_from_old_node_preserve_meta(
     new_node = quantized_graph.create_node(*create_node_args)
     new_node.stack_trace = old_node.stack_trace
     return new_node
+
+def get_all_args_as_positional_args(node: Node) -> List[Argument]:
+    """ Get a list of args and kwargs as positional args
+    """
+    all_args = list(node.args)
+    all_args.extend(list(node.kwargs.values()))
+    return all_args
+
+__all__ = [
+    "graph_pretty_str",
+    "get_per_tensor_qparams",
+    "get_quantize_node_info",
+    "quantize_node",
+    "get_custom_module_class_keys",
+    "get_linear_prepack_op_for_dtype",
+    "get_qconv_prepack_op",
+    "get_qconv_op",
+    "get_new_attr_name_with_prefix",
+    "collect_producer_nodes",
+    "graph_module_from_producer_nodes",
+    "assert_and_get_unique_device",
+    "create_getattr_from_value",
+    "create_qparam_nodes",
+    "all_node_args_have_no_tensors",
+    "all_node_args_except_first",
+    "return_arg_list",
+    "get_non_observable_arg_indexes_and_types",
+    "node_return_type_is_int",
+    "is_get_tensor_info_node",
+    "maybe_get_next_module",
+    "create_node_from_old_node_preserve_meta",
+    "get_all_args_as_positional_args",
+    "NodeInfo",
+]
