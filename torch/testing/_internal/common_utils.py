@@ -40,6 +40,7 @@ import errno
 import ctypes
 from typing import Any, Dict, Iterable, Iterator, Optional, Union, List, Tuple, Type, TypeVar, Callable
 from unittest.mock import MagicMock
+import pytest
 
 import numpy as np
 
@@ -74,6 +75,8 @@ from torch._C import ScriptList, ScriptDict  # type: ignore[attr-defined]
 from torch.onnx import (register_custom_op_symbolic,
                         unregister_custom_op_symbolic)
 torch.backends.disable_global_flags()
+
+USE_PYTEST = ["test_ops", "test_ops_gradients", "test_ops_jit"]
 
 FILE_SCHEMA = "file://"
 if sys.platform == 'win32':
@@ -586,11 +589,26 @@ def lint_test_case_extension(suite):
                 succeed = False
     return succeed
 
+def sanitize_pytest_xml(xml_file: str):
+    # pytext xml is different from unittext xml, this function makes pytest xml more similar to unittest xml
+    # should consider writing an equivalent of junitxml plugin to do this
+    import xml.etree.ElementTree as ET
+    tree = ET.parse(xml_file)
+    for testcase in tree.iter('testcase'):
+        full_classname = testcase.attrib['classname']
+        regex_result = re.search("^test\.(.*)\.([^\.]*)$", full_classname)
+        classname = regex_result.group(2)
+        file = regex_result.group(1).replace('.', "/")
+        testcase.set('classname', classname)
+        testcase.set('file', f"{file}.py")
+    tree.write(xml_file)
+
 def run_tests(argv=UNITTEST_ARGS):
     # import test files.
     if IMPORT_SLOW_TESTS:
         if os.path.exists(IMPORT_SLOW_TESTS):
             with open(IMPORT_SLOW_TESTS, 'r') as fp:
+                # use env vars so pytest-xdist subprocesses can still access them
                 os.environ['SLOW_TESTS_DICT'] = fp.read()
         else:
             print(f'[WARNING] slow test file provided but not found: {IMPORT_SLOW_TESTS}')
@@ -680,11 +698,19 @@ def run_tests(argv=UNITTEST_ARGS):
         verbose = '--verbose' in argv or '-v' in argv
         if verbose:
             print('Test results will be stored in {}'.format(test_report_path))
-        if "test_ops" in test_filename or test_filename == "test_utils" or test_filename == "test_dataloader":
-            subprocess.run([sys.executable, "-m", "pip", "install", "pytest", "pytest-xdist"])
-            import pytest
+        if test_filename in USE_PYTEST:
+            test_report_path.replace('python-unittest', 'python-pytest')
+            os.makedirs(test_report_path, exist_ok=True)
+            # eventually move this to test.sh
+            if subprocess.run([sys.executable, "-m", "pip", "show", "pytest-dist"], 
+                              capture_output=True).returncode != 0:
+                subprocess.run([sys.executable, "-m", "pip", "install", "pytest-xdist"])
             os.environ["NO_COLOR"] = "1"
-            pytest.main(args=[inspect.getfile(sys._getframe(1)), '-n=1', '-vv', f'--junitxml={test_report_path}.xml'])
+            test_report_path = os.path.join(test_report_path, test_filename)
+            exit_code = pytest.main(args=[inspect.getfile(sys._getframe(1)), '-n=2', '-vv',
+                                    f'--junitxml={test_report_path}.xml'])
+            sanitize_pytest_xml(f'{test_report_path}.xml')
+            exit(exit_code)
         else:
             unittest.main(argv=argv, testRunner=xmlrunner.XMLTestRunner(
                 output=test_report_path,
