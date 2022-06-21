@@ -47,7 +47,7 @@ def get_file_pathnames_from_root(
         non_deterministic: bool = False) -> Iterable[str]:
 
     # print out an error message and raise the error out
-    def onerror(err : OSError):
+    def onerror(err: OSError):
         warnings.warn(err.filename + " : " + err.strerror)
         raise err
 
