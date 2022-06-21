@@ -21,10 +21,11 @@ from torch._prims.utils import (
 import torch._refs.linalg as linalg
 import torch._refs.linalg.utils
 
-from typing import Optional, List
+from typing import Optional, List, Tuple
 from functools import partial
 
 __all__ = [
+    "svd",
     "vector_norm",
 ]
 
@@ -127,3 +128,14 @@ def vector_norm(
         if not (ord % 2.0 == 0.0 and is_float_dtype(x.dtype)):
             x = prims.abs(x)
         return to_result_dtype(fast_pow(reduce_sum(fast_pow(x, ord)), 1.0 / ord))
+
+
+# out_wrapper_multi is buggy (see the note in its definition), and so is the `linalg.svd` out behaviour
+@out_wrapper("U", "S", "Vh")
+def svd(A: TensorLikeType, full_matrices: bool = True) -> Tuple[Tensor, Tensor, Tensor]:
+    return prims.svd(A, full_matrices=full_matrices)
+
+
+@out_wrapper()
+def svdvals(A: TensorLikeType) -> Tensor:
+    return svd(A, full_matrices=False)[1]
