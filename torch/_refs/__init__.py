@@ -1120,7 +1120,7 @@ def sub(
     alpha: Optional[NumberType] = None,
 ):
     """
-    Reference implementation of torch.add
+    Reference implementation of torch.sub
     """
 
     if isinstance(a, Number) and isinstance(b, Number):
