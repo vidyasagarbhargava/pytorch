@@ -3,6 +3,7 @@ from torch.utils.data.graph_settings import apply_shuffle_seed
 
 __all__ = [
     "simple_fast_forward_graph",
+    "fast_forward_graph",
 ]
 
 
@@ -17,6 +18,8 @@ def simple_fast_forward_graph(datapipe: IterDataPipe, n_iterations: int, rng=Non
     fast-forward its parent DataPipes as well at the cost of re-doing every computation.
     For instance, applying this function to the final DataPipe of a graph will fast-forward
     every DataPipe within the graph.
+
+    This can also be used on source nodes within DataPipe graph with no input DataPipe.
 
     Note:
         This is the simplest but least efficient way to fast-forward a DataPipe. Usage of other fast-forwarding
@@ -45,3 +48,18 @@ def simple_fast_forward_graph(datapipe: IterDataPipe, n_iterations: int, rng=Non
     # This will prevent the DataPipe from resetting in the `iter()` call
     # If another DataPipe is consuming it, it won't have to start over again
     datapipe._restored = True
+
+
+def fast_forward_graph(datapipe: IterDataPipe, n_iterations: int) -> None:
+
+    # 1. Get a graph of the datapipe
+    # 2. Traverse from output toward source, label fast-forward strategy for each
+    # 2.a. If nothing is available for that node, use `simple_fast_forward_graph` up-to that point, you can stop there,
+    #      and mark that as source
+    # 3. Starting from the source, fast-forward each node down, assuming the inputs have been fast-forwarded properly.
+
+    # There are 3 fast-forwarding strategy
+    # 1. Source - fast-forward by
+    # 2. Stateless -
+    # 3. Stateful - restore buffer (may need custom fast-forward function)
+    pass
