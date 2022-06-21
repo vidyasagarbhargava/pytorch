@@ -112,6 +112,7 @@ class IterDataPipe(IterableDataset[T_co], metaclass=_IterDataPipeMeta):
     _valid_iterator_id: Optional[int] = None
     _number_of_samples_yielded: int = 0
     _restored: bool = False
+    _fast_forward_iterator: Optional[Iterator] = None
 
     def __getattr__(self, attribute_name):
         if attribute_name in IterDataPipe.functions:
@@ -186,12 +187,19 @@ class IterDataPipe(IterableDataset[T_co], metaclass=_IterDataPipeMeta):
         # Instead of showing <torch. ... .MapperIterDataPipe object at 0x.....>, return the class name
         return str(self.__class__.__qualname__)
 
-    def reset(self):
+    def reset(self) -> None:
         r"""
         Reset the `IterDataPipe` to the initial state. By default, no-op. For subclasses of `IterDataPipe`,
         depending on their functionalities, they may want to override this method with implementations that
         may clear the buffers and reset pointers of the DataPipe.
         The `reset` method is always called when `__iter__` is called as part of `hook_iterator`.
+        """
+        pass
+
+    def fast_forward(self, n_iterations: int) -> None:
+        r"""
+        Reset the DataPipe (which invalidates all iterators), then fast forward the state of `IterDataPipe`
+        by the given number of iterations relative to its initialized state.
         """
         pass
 
