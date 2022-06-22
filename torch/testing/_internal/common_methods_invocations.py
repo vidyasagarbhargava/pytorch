@@ -19757,7 +19757,7 @@ op_db: List[OpInfo] = [
     UnaryUfuncInfo(
         'special.gamma',
         decorators=(
-            precisionOverride(
+            toleranceOverride(
                 {
                     torch.float32: 1e-03,
                     torch.float64: 1e-05,
