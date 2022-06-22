@@ -738,8 +738,8 @@ class GitHubPR:
             repo.checkout(self.default_branch())
 
         repo.push(self.default_branch(), dry_run)
-        gh_post_comment(self.org, self.project, self.pr_num,
-                        f"@{self.get_pr_creator_login()} your PR has been successfully merged.", dry_run)
+        gh_post_pr_comment(self.org, self.project, self.pr_num,
+                           f"@{self.get_pr_creator_login()} your PR has been successfully merged.", dry_run)
         if not dry_run:
             gh_add_labels(self.org, self.project, self.pr_num, ["merged"])
 
@@ -768,9 +768,9 @@ class GitHubPR:
         repo._run_git('checkout', "-b", branch_name)
         repo._run_git('push', '-u', 'origin', branch_name, '--force')
         commit = repo.get_commit('HEAD').commit_hash
-        _gh_post_comment(self.org, self.project, self.pr_num,
-                        'Successfully started land time checks.' +
-                        f' See progress here: https://github.com/{self.org}/{self.project}/commit/{commit}')
+        gh_post_pr_comment(self.org, self.project, self.pr_num,
+                           'Successfully started land time checks.' +
+                           f' See progress here: https://github.com/{self.org}/{self.project}/commit/{commit}')
         return commit
 
 
