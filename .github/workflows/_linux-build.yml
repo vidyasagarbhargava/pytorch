@@ -3,24 +3,49 @@ name: linux-build
 on:
   workflow_call:
     inputs:
-      build-environment:
-        required: true
-        type: string
-        description: Top-level label for what's being built/tested.
       docker-image-name:
         required: true
         type: string
         description: Name of the base docker image to build with.
-      build-generates-artifacts:
+      force-docker-tag:
+        required: false
+        type: string
+        default: ""
+        description: |
+          If set, force the CI to use this docker tag instead of calculating it
+          based on the state of the repo.
+      upload-artifacts:
         required: false
         type: boolean
         default: true
-        description: If set, upload generated build artifacts.
+        description: Whether to upload the build artifacts
+      artifact-suffix:
+        required: false
+        type: string
+        default: ""
+        description: |
+          TODO
       build-with-debug:
         required: false
         type: boolean
         default: false
         description: If set, build in debug mode.
+      env-variables:
+        required: false
+        type: string
+        default: ""
+        description: |
+          Supplementary list of environment variables to set (will get passed to docker as well).
+          If this is set, an `artifact-suffix` input is required, to avoid
+          colliding with other build artifacts that use the same docker image.
+      script:
+        required: false
+        type: string
+        default: .jenkins/pytorch/build.sh
+        description: |
+          Build script to use. Will be run inside docker.
+          If this is set, an `artifact-suffix` input is required, to avoid
+          colliding with other build artifacts that use the same docker image.
 
     outputs:
       docker-image:
@@ -43,15 +68,24 @@ jobs:
       - name: Checkout PyTorch
         uses: pytorch/pytorch/.github/actions/checkout-pytorch@master
 
-      - name: Check for new workflows
-        run: |
-          if [ ! -f "./.github/actions/setup-linux/action.yml" ]; then
-            echo "::error::Your PR is based on a version of master that is too old for our CI to work. Please rebase your PR on latest master and resubmit."
-            exit 1
-          fi
+      - name: Validate workflow inputs
+        env:
+          WORKFLOW_INPUTS: toJSON(inputs)
+        run: echo "${WORKFLOW_INPUTS}" | python .github/scripts/validate_workflow_inputs.py
 
       - name: Setup Linux
         uses: ./.github/actions/setup-linux
+
+      - name: Add additional environment variables
+        env:
+          ENV_VARS: ${{ inputs.env-variables }}
+        run: |
+          if [[ -n "${ENV_VARS}" ]]; then
+            echo "${ENV_VARS}" >> "${GITHUB_ENV}"
+            echo "${ENV_VARS}" >> "/tmp/docker_env_${GITHUB_RUN_ID}"
+          fi
+          env | grep '^GITHUB' >> "/tmp/docker_env_${GITHUB_RUN_ID}"
+          env | grep '^CI' >> "/tmp/docker_env_${GITHUB_RUN_ID}"
 
       - name: Setup SSH (Click me for login details)
         uses: ./.github/actions/setup-ssh
@@ -63,7 +97,7 @@ jobs:
         uses: ./.github/actions/calculate-docker-image
         with:
           docker-image-name: ${{ inputs.docker-image-name }}
-          xla: ${{ contains(inputs.build-environment, 'xla') }}
+          force-docker-tag: ${{ inputs.force-docker-tag }}
 
       - name: Pull docker image
         uses: ./.github/actions/pull-docker-image
@@ -83,7 +117,6 @@ jobs:
 
       - name: Build
         env:
-          BUILD_ENVIRONMENT: ${{ inputs.build-environment }}
           BRANCH: ${{ steps.parse-ref.outputs.branch }}
           # TODO duplicated
           AWS_DEFAULT_REGION: us-east-1
@@ -94,13 +127,13 @@ jobs:
           PR_LABELS: ${{ toJson(github.event.pull_request.labels.*.name) }}
           TORCH_CUDA_ARCH_LIST: 5.2
           DOCKER_IMAGE: ${{ steps.calculate-docker-image.outputs.docker-image }}
-          XLA_CUDA: ${{ contains(inputs.build-environment, 'xla') && '0' || '' }}
+          XLA_CUDA: 0
           DEBUG: ${{ inputs.build-with-debug && '1' || '0' }}
           OUR_GITHUB_JOB_ID: ${{ steps.get-job-id.outputs.job-id }}
+          BUILD_SCRIPT: ${{ inputs.script }}
         run: |
           # detached container should get cleaned up by teardown_ec2_linux
           container_name=$(docker run \
-            -e BUILD_ENVIRONMENT \
             -e MAX_JOBS="$(nproc --ignore=2)" \
             -e AWS_DEFAULT_REGION \
             -e PR_NUMBER \
@@ -113,7 +146,7 @@ jobs:
             -e TORCH_CUDA_ARCH_LIST \
             -e PR_LABELS \
             -e OUR_GITHUB_JOB_ID \
-            --env-file="/tmp/github_env_${GITHUB_RUN_ID}" \
+            --env-file="/tmp/docker_env_${GITHUB_RUN_ID}" \
             --security-opt seccomp=unconfined \
             --cap-add=SYS_PTRACE \
             --tty \
@@ -123,18 +156,18 @@ jobs:
             -w /var/lib/jenkins/workspace \
             "${DOCKER_IMAGE}"
           )
-          docker exec -t "${container_name}" sh -c '.jenkins/pytorch/build.sh'
+          docker exec -t "${container_name}" sh -c "${BUILD_SCRIPT}"
 
       - name: Archive artifacts into zip
-        if: inputs.build-generates-artifacts
+        if: inputs.upload-artifacts
         run: |
           zip -1 -r artifacts.zip dist/ build/custom_test_artifacts build/lib build/bin .pytorch-test-times.json
 
       - name: Store PyTorch Build Artifacts on S3
         uses: seemethere/upload-artifact-s3@v5
-        if: inputs.build-generates-artifacts
+        if: inputs.upload-artifacts
         with:
-          name: ${{ inputs.build-environment }}
+          name: ${{ inputs.docker-image-name }}-${{ inputs.artifact-suffix }}
           retention-days: 14
           if-no-files-found: error
           path: artifacts.zip
