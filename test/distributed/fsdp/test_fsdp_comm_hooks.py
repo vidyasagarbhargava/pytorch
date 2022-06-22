@@ -1,7 +1,6 @@
 # Owner(s): ["oncall: distributed"]
 
 import copy
-import os
 import sys
 from typing import Optional
 
@@ -24,8 +23,6 @@ from torch.testing._internal.common_utils import (
 if not dist.is_available():
     print("Distributed not available, skipping tests", file=sys.stderr)
     sys.exit(0)
-
-BACKEND = os.environ["BACKEND"]
 
 class TestCommunicationHooks(FSDPTest):
 
