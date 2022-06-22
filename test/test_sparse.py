@@ -3494,7 +3494,6 @@ class TestSparse(TestCase):
         test(4, 6, [7, 3, 1, 3, 2, 1], [7, 3, 1, 3, 2, 3])
 
     @unittest.skipIf(not TEST_NUMPY, "NumPy is not availible")
-    @onlyCPU
     @dtypes(*all_types_and_complex_and(torch.bool))
     def test_sparse_spdiags(self, device, dtype):
 
@@ -3505,7 +3504,6 @@ class TestSparse(TestCase):
         if TEST_SCIPY:
             def reference(diags, offsets, shape):
                 return scipy.sparse.spdiags(diags.detach().cpu(), offsets.cpu(), *shape).toarray()
-
         else:
             def reference(diags, offsets, shape):
                 result = torch.zeros(shape, dtype=dtype, device=device)
@@ -3526,9 +3524,17 @@ class TestSparse(TestCase):
                 ex_layout = torch.sparse_coo
             else:
                 ex_layout = layout
-            out_dense = out.to_dense()
+            out_dense = out.to_dense().cpu()
             self.assertTrue(out.layout == ex_layout, f"Output layout {out.layout} expected {ex_layout}")
             self.assertEqual(out_dense, ref_out, f"Result:\n{out_dense} does not match reference:\n{ref_out}")
+
+            # todo: remove device condition once cuda backward is added
+            if requires_grad and (layout is None) and (not diags.is_cuda):
+                def gc_fn(d):
+                    return _sparse_to_dense(torch.sparse.spdiags(d, offsets, shape, layout=layout))
+
+                self.assertTrue(gradcheck(gc_fn, (diags,)))
+
 
         def check_invalid(args, error):
             with self.assertRaisesRegex(RuntimeError, error):
