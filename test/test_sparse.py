@@ -3498,12 +3498,13 @@ class TestSparse(TestCase):
     @dtypes(*all_types_and_complex_and(torch.bool))
     def test_sparse_spdiags(self, device, dtype):
 
-        make_diags = functools.partial(make_tensor, dtype=dtype, device=device)
+        requires_grad = dtype in (torch.double, torch.cdouble)
+        make_diags = functools.partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
         make_offsets = functools.partial(torch.tensor, dtype=torch.long, device=device)
 
         if TEST_SCIPY:
             def reference(diags, offsets, shape):
-                return scipy.sparse.spdiags(diags, offsets, *shape).toarray()
+                return scipy.sparse.spdiags(diags.detach().cpu(), offsets.cpu(), *shape).toarray()
 
         else:
             def reference(diags, offsets, shape):

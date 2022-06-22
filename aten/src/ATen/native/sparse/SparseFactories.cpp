@@ -152,6 +152,56 @@ void _spdiags_setup_cpu(
   iter.for_each(loop);
 }
 
+void spdiags_backward_from_coo(
+    const Tensor& grad_out,
+    const Tensor& offsets,
+    const int64_t n_diag,
+    const int64_t n_col_in,
+    const int64_t n_col_out,
+    const int64_t n_row_out,
+    Tensor& grad_in) {
+  using namespace at::indexing;
+  auto offsets_accessor = offsets.accessor<int64_t, 1>();
+  AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND4(
+      at::ScalarType::BFloat16,
+      at::ScalarType::Half,
+      at::ScalarType::Bool,
+      at::ScalarType::ComplexHalf,
+      grad_out.scalar_type(),
+      "spdiags_backward_coo",
+      [&] {
+        auto grad_in_accessor = grad_in.accessor<scalar_t, 2>();
+        auto grad_out_values_accessor =
+            get_sparse_impl(grad_out)->values_.accessor<scalar_t, 1>();
+        auto grad_out_indices_accessor =
+            get_sparse_impl(grad_out)->indices_.accessor<int64_t, 2>();
+        auto nnz = get_sparse_impl(grad_out)->nnz();
+        for (const auto i : c10::irange(n_diag)) {
+          const int64_t offset_i = offsets_accessor[i];
+          const int64_t abs_off = std::abs(offset_i);
+          // First column index read from (grad_out), also first column index to
+          // write to (grad_in/result)
+          const int64_t col_begin = offset_i < 0 ? 0 : offset_i;
+          // Last column index read from (grad_out) also last column index to
+          // write to (grad_in/result)
+          const int64_t n_col = std::min(
+              n_col_in, std::min(n_row_out - abs_off, n_col_out - abs_off));
+          // Loop over the range to read/write
+          for (const auto j : c10::irange(n_col)) {
+            const int64_t col_idx = col_begin + j;
+            const int64_t row_idx = col_idx - offset_i;
+            for (int64_t nnz_idx = 0; nnz_idx < nnz; ++nnz_idx) {
+              if ((grad_out_indices_accessor[0][nnz_idx] == row_idx) &&
+                  (grad_out_indices_accessor[1][nnz_idx] == col_idx)) {
+                grad_in_accessor[i][col_idx] +=
+                    grad_out_values_accessor[nnz_idx];
+              }
+            }
+          }
+        }
+      });
+}
+
 } // namespace
 
 Tensor spdiags_cpu(
@@ -167,5 +217,42 @@ Tensor spdiags_cpu(
       _spdiags_setup_cpu,
       _spdiags_kernel_cpu);
 }
+
+Tensor spdiags_backward_sparse_cpu(
+    const Tensor& grad_out,
+    const Tensor& offsets,
+    IntArrayRef input_shape) {
+  auto offsets_1d = offsets.dim() == 0 ? offsets.unsqueeze(0) : offsets;
+
+  auto n_diag = input_shape.size() == 2 ? input_shape[0] : 1;
+  auto n_col_in = input_shape.size() == 2 ? input_shape[1] : input_shape[0];
+  AT_ASSERT(grad_out.dim() == 2);
+  AT_ASSERT(offsets_1d.size(0) == n_diag);
+  auto n_col_out = grad_out.size(1);
+  auto n_row_out = grad_out.size(0);
+  // auto output_layout = grad_out.layout();
+  auto grad_in_options = grad_out.options().layout(Layout::Strided);
+  Tensor grad_in = at::zeros({n_diag, n_col_in}, grad_in_options);
+  if (grad_out.layout() == Layout::Sparse) {
+    spdiags_backward_from_coo(
+        grad_out, offsets_1d, n_diag, n_col_in, n_col_out, n_row_out, grad_in);
+  } else {
+    // Todo, for backward efficient implementation from different formats should
+    // be possible
+    spdiags_backward_from_coo(
+        grad_out.to_sparse(),
+        offsets_1d,
+        n_diag,
+        n_col_in,
+        n_col_out,
+        n_row_out,
+        grad_in);
+  }
+  if (input_shape.size() == 1) {
+    grad_in = grad_in.squeeze();
+  }
+  return grad_in;
+}
+
 } // namespace native
 } // namespace at
