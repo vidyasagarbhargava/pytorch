@@ -1019,7 +1019,7 @@ gamma = _add_docstr(_special.special_gamma,
                     r"""
 gamma(input, *, out=None) -> Tensor
 
-Gamma function :math:`\Gamma\left(\text{input}\right)` defined as the 
+Gamma function :math:`\Gamma\left(\text{input}\right)` defined as the
 convergent improper integral:
 
 .. math::
