@@ -1170,6 +1170,7 @@ class FullyShardedDataParallel(nn.Module):
                     not hasattr(p, "_params_exec_order_hook_handle")
                 ), "When not in execution order prep stage, all _params_exec_order_hook_handle should be removed."
         return is_prep_stage
+
     def _get_default_comm_hook(self) -> Any:
         """
         Sets a default communication hook based on a sharding strategy.
@@ -2922,7 +2923,7 @@ class FullyShardedDataParallel(nn.Module):
                     param.grad.data = param.grad.data.to(self.mixed_precision.reduce_dtype)
 
                 if self.gradient_predivide_factor > 1 and\
-                    self.communication_hook == self._get_default_comm_hook():
+                        self.communication_hook == self._get_default_comm_hook():
                     # Average grad by world_size for consistency with PyTorch DDP.
                     param.grad.div_(self.gradient_predivide_factor)
 
