@@ -38,6 +38,7 @@ from torch.distributed._shard.sharded_tensor import (
     ShardedTensor,
     init_from_local_shards,
 )
+from torch.distributed.algorithms._comm_hooks import allreduce_hook
 from torch.distributed.distributed_c10d import _get_default_group
 from torch.distributed.utils import (
     _replace_by_prefix,
@@ -728,6 +729,7 @@ class FullyShardedDataParallel(nn.Module):
                 sync_module_states=sync_module_states,
             )
 
+        self._comm_hook_was_called = False
         self.process_group = process_group or _get_default_group()
         self.rank = self.process_group.rank()
         self.world_size = self.process_group.size()
@@ -946,6 +948,9 @@ class FullyShardedDataParallel(nn.Module):
                 m._param_exec_order_policy = True
                 m._param_exec_order_prep_stage = True
 
+        # setting communication hook to a default
+        self.communication_hook = self._get_default_comm_hook()
+        self.communication_hook_state = self._get_default_comm_hook_state()
 
     def _move_module_if_needed(self, module) -> None:
         """
@@ -1165,6 +1170,23 @@ class FullyShardedDataParallel(nn.Module):
                     not hasattr(p, "_params_exec_order_hook_handle")
                 ), "When not in execution order prep stage, all _params_exec_order_hook_handle should be removed."
         return is_prep_stage
+    def _get_default_comm_hook(self) -> Any:
+        """
+        Sets a default communication hook based on a sharding strategy.
+        """
+        if self.sharding_strategy != ShardingStrategy.NO_SHARD:
+            return None
+        else:
+            return allreduce_hook.allreduce_hook
+
+    def _get_default_comm_hook_state(self) -> Any:
+        """
+        Sets a default communication hook state based on a sharding strategy.
+        """
+        if self.sharding_strategy != ShardingStrategy.NO_SHARD:
+            return None
+        else:
+            return allreduce_hook.AllReduceState(process_group=self.process_group)
 
     @staticmethod
     def fsdp_modules(
@@ -2899,7 +2921,8 @@ class FullyShardedDataParallel(nn.Module):
                     # reduce_dtype matches the param dtype.
                     param.grad.data = param.grad.data.to(self.mixed_precision.reduce_dtype)
 
-                if self.gradient_predivide_factor > 1 and self.sharding_strategy != ShardingStrategy.NO_SHARD:
+                if self.gradient_predivide_factor > 1 and\
+                    self.communication_hook == self._get_default_comm_hook():
                     # Average grad by world_size for consistency with PyTorch DDP.
                     param.grad.div_(self.gradient_predivide_factor)
 
@@ -2976,19 +2999,9 @@ class FullyShardedDataParallel(nn.Module):
                     ), "Currently the way for _is_sharded to be False is \
                         world_size == 1 or sharding_stratagy is set to be NO_SHARD"
                     if self.sharding_strategy == ShardingStrategy.NO_SHARD:
-                        # if a communication hook was registered,
-                        # then a model has attribute ``communication_hook``
-                        if hasattr(self, "communication_hook"):
-                            self.communication_hook(self.communication_hook_state, param.grad)
-                        else:
-                            # we skipped predivide earlier for NO_SHARD
-                            # this is a no-hook case, so need to predivide grads
-                            if self.gradient_predivide_factor > 1:
-                                param.grad.div_(self.gradient_predivide_factor)
-                            dist.all_reduce(param.grad, group=self.process_group)
-                            if self.gradient_postdivide_factor > 1:
-                                # Average grad by world_size for consistency with PyTorch DDP.
-                                param.grad.div_(self.gradient_postdivide_factor)
+                        # if a communication hook was not registered,
+                        # then a default hook (`all_reduce`) will be used
+                        self.communication_hook(self.communication_hook_state, param.grad)
 
                     # Note that we need to cast grads back to the full precision if
                     # 1) parameters were in reduced precision during fwd, as grads
@@ -3411,7 +3424,6 @@ class FullyShardedDataParallel(nn.Module):
 
     def register_comm_hook(self, state: object, hook: callable):
         r"""
-
         Registers a communication hook which is an enhancement that provides a
         flexible hook to users where they can specify how FSDP aggregates gradients
         across multiple workers.
@@ -3421,13 +3433,17 @@ class FullyShardedDataParallel(nn.Module):
         parameter syncs while running Fully Sharded Data Parallel training.
 
         .. warning::
-            FSDP only support communication hooks for a NO_SHARD strategy at this time.
+            FSDP only support communication hooks for a ``NO_SHARD`` strategy at this time.
             If other strategies are used, an error will be raised.
+
+        .. warning ::
+            FSDP communication hook should be registered before running an initial forward pass
+            and only once.
 
         Args:
             state (object): Passed to the hook to maintain any state information during the training process.
                             Examples include error feedback in gradient compression,
-                            peers to communicate with next in GossipGrad, etc.
+                            peers to communicate with next in `GossipGrad <https://arxiv.org/abs/1803.05880>`_, etc.
 
                             It is locally stored by each worker
                             and shared by all the gradient tensors on the worker.
@@ -3436,24 +3452,25 @@ class FullyShardedDataParallel(nn.Module):
                              ``hook: Callable[torch.Tensor] -> None``:
 
                              This function takes in a python tensor, which represents a gradient
-                             that needs to be communicated across ranks. It then performs
-                             all neccessary processing and returns nothing.
+                             of a loss function with respect to variables of a model
+                             for the local batch that needs to be communicated across ranks.
+                             It then performs all neccessary processing and returns nothing.
 
         """
+        assert self.check_is_root(), "register_comm_hook can only be called on a root instance."
+        assert not self._comm_hook_was_called, "register_comm_hook can be only called once"
         if self.sharding_strategy != ShardingStrategy.NO_SHARD:
-
-            raise RuntimeError(
+            raise NotImplementedError(
                 "Communication hooks are currently only available for a NO_SHARD strategy."
             )
         else:
             # register same hook for root and all submodules
             for submodule in self.fsdp_modules(self):
-                if submodule.check_is_root():
-                    logger.warn(
-                        f"NOTE: {hook.__qualname__} will be shared across all submodules."
-                    )
-                submodule.communication_hook_state = state
-                submodule.communication_hook = hook
+                submodule._comm_hook_was_called = True
+                # registering hook only if it hasn't been already registered
+                if submodule.communication_hook == self._get_default_comm_hook():
+                    submodule.communication_hook_state = state
+                    submodule.communication_hook = hook
 
 
 

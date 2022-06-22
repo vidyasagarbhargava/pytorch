@@ -1,20 +1,18 @@
 # Owner(s): ["oncall: distributed"]
 
+import copy
+import os
 import sys
 from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
 from torch import distributed as dist
-from torch.distributed.algorithms.fsdp_comm_hooks import allreduce_hook
+from torch.distributed.algorithms._comm_hooks import allreduce_hook
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.fully_sharded_data_parallel import ShardingStrategy
-from torch.distributed.fsdp.wrap import (
-    enable_wrap,
-    wrap,
-)
+
 from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
 from torch.testing._internal.common_fsdp import FSDPTest
 from torch.testing._internal.common_utils import (
@@ -27,11 +25,56 @@ if not dist.is_available():
     print("Distributed not available, skipping tests", file=sys.stderr)
     sys.exit(0)
 
+BACKEND = os.environ["BACKEND"]
+
 class TestCommunicationHooks(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     @parametrize(
-        "has_wrapping", [True, False])
+        "sharding_strategy",
+        [
+            ShardingStrategy.NO_SHARD
+        ])
+    def test_default_communication_hook_behaviour(
+        self,
+        sharding_strategy: Optional[ShardingStrategy]
+    ):
+        m = torch.nn.Linear(1, 2, bias=False)
+
+        net_default_hook = FSDP(
+            copy.deepcopy(m),
+            device_id=torch.cuda.current_device(),
+            sharding_strategy=sharding_strategy
+        ).to(self.rank)
+
+        inpt = torch.tensor([self.rank]).float().cuda(self.rank)
+
+        for _ in range(4):
+
+            # Clear gradients manually.
+            for entry in net_default_hook.parameters():
+                if entry.grad is not None:
+                    entry.grad.requires_grad_(False)
+                    entry.grad.zero_()
+
+            loss = net_default_hook(inpt).sum()
+            loss.backward()
+
+            # For each worker, the gradient on the weight should be worker_rank.
+            grad = [param.grad for param in net_default_hook.parameters()]
+
+            avg = copy.deepcopy(grad[0])
+            expected_grad = (
+                sum(i for i in range(dist.get_world_size())) / dist.get_world_size()
+            )
+            # Verify default hook produces expected gradients
+            self.assertEqual(
+                avg[0].item(),
+                expected_grad,
+                msg=f"Expected hook grad of {expected_grad} but got {avg[0].item()}")
+
+    @skip_if_lt_x_gpu(2)
+    @parametrize("has_wrapping", [True, False])
     @parametrize(
         "sharding_strategy",
         [
@@ -39,7 +82,7 @@ class TestCommunicationHooks(FSDPTest):
             ShardingStrategy.FULL_SHARD,
             ShardingStrategy.SHARD_GRAD_OP
         ])
-    def test_communication_hook_allreduce(
+    def test_default_communication_hook_initialization(
         self,
         has_wrapping: bool,
         sharding_strategy: Optional[ShardingStrategy]
@@ -55,6 +98,19 @@ class TestCommunicationHooks(FSDPTest):
             sharding_strategy (Optional[ShardingStrategy]): Configures the FSDP algorithm.
         """
 
+        class DummyState(object):
+
+            __slots__ = [
+                "process_group"
+            ]
+
+            def __init__(self, process_group):
+                self.process_group = process_group
+
+        def dummy_hook(state: DummyState, grad: torch.Tensor):
+            pass
+
+
         class Net(nn.Module):
 
             def __init__(self, has_wrapping):
@@ -62,16 +118,32 @@ class TestCommunicationHooks(FSDPTest):
                 torch.manual_seed(0)
                 torch.cuda.manual_seed(0)
                 super().__init__()
+
                 if has_wrapping:
-                    with enable_wrap(wrapper_cls=FSDP, device_id=torch.cuda.current_device()):
-                        self.fc1 = wrap(nn.Linear(8, 16))
+                    self.net = FSDP(nn.Sequential(
+                        nn.Linear(8, 16),
+                        nn.ReLU(),
+                        FSDP(
+                            nn.Linear(16, 8),
+                            device_id=torch.cuda.current_device(),
+                            sharding_strategy=sharding_strategy
+                        )
+                    ),
+                        device_id=torch.cuda.current_device(),
+                        sharding_strategy=sharding_strategy
+                    )
+
                 else:
-                    self.fc1 = nn.Linear(8, 16)
-                self.relu = F.relu
-                self.fc2 = nn.Linear(16, 4)
+                    self.net = nn.Sequential(
+                        nn.Linear(8, 16),
+                        nn.ReLU(),
+                        nn.Linear(16, 8)
+                    )
+
+                self.out = nn.Linear(8, 4)
 
             def forward(self, x):
-                return self.fc2(self.relu(self.fc1(x)))
+                return self.out(F.relu(self.net(x)))
 
         # Initialize the model and inputs
         device = torch.device("cuda")
@@ -80,90 +152,50 @@ class TestCommunicationHooks(FSDPTest):
             device_id=torch.cuda.current_device(),
             sharding_strategy=sharding_strategy
         ).to(device)
-        fsdp_model_no_hook = FSDP(
-            Net(has_wrapping),
-            device_id=torch.cuda.current_device(),
-            sharding_strategy=sharding_strategy
-        ).to(device)
-        optimizer1 = optim.SGD(fsdp_model_with_hook.parameters(), lr=0.01)
-        optimizer2 = optim.SGD(fsdp_model_no_hook.parameters(), lr=0.01)
 
-        input = torch.randn(7, 8, device=device)
-        target = torch.randn(7, 4, device=device)
-
-        # At this point we didn't register any communication hooks.
-        for entry in FSDP.fsdp_modules(fsdp_model_with_hook):
-            self.assertFalse(hasattr(entry, "communication_hook"))
-            self.assertFalse(hasattr(entry, "communication_hook_state"))
-
-        # Initialize allreduce hook state
-        allreduce_state = allreduce_hook.AllReduceState(
-            process_group=None,
-            world_size=dist.get_world_size()
-        )
+        dummy_state = DummyState(process_group=None)
 
         # FSDP currently suports communication hooks for a NO_SHARD strategy
-        # Check that a Runtime Error is raised for other strategies
+        # Check that a `NotImplementedError`` is raised for other strategies
         if sharding_strategy != ShardingStrategy.NO_SHARD:
+            # Check that default hook is set to None
+            for entry in FSDP.fsdp_modules(fsdp_model_with_hook):
+                self.assertIsNone(entry.communication_hook)
+                self.assertIsNone(entry.communication_hook_state)
 
-            with self.assertRaises(RuntimeError) as captured:
-                fsdp_model_with_hook.register_comm_hook(allreduce_state, allreduce_hook.allreduce_hook)
+            with self.assertRaises(
+                NotImplementedError,
+                msg="Communication hooks are currently only available for a NO_SHARD strategy."
+            ):
+                fsdp_model_with_hook.register_comm_hook(dummy_state, dummy_hook)
 
-            # Check that the logger has an expected entry
-            self.assertEqual(
-                str(captured.exception),
-                "Communication hooks are currently only available for a NO_SHARD strategy."
-            )
         else:
 
-            with self.assertLogs() as captured:
-                fsdp_model_with_hook.register_comm_hook(allreduce_state, allreduce_hook.allreduce_hook)
+            # Check that default hook is set to `all_reduce`
+            for entry in FSDP.fsdp_modules(fsdp_model_with_hook):
+                self.assertEqual(entry.communication_hook, allreduce_hook.allreduce_hook)
 
-            # Check that the logger has only one entry
-            self.assertEqual(len(captured.records), 1)
-
-            # Check that the logger has an expected entry
-            self.assertEqual(
-                captured.records[0].getMessage(),
-                f"NOTE: {allreduce_hook.allreduce_hook.__qualname__} will be shared across all submodules."
+            dummy_state = DummyState(process_group=None)
+            fsdp_model_with_hook.register_comm_hook(
+                dummy_state,
+                dummy_hook
             )
-
-            # Check that the hook was registered for the root and all submodules if any
-            # At this point we didn't register any communication hooks.
-            for entry in FSDP.fsdp_modules(fsdp_model_with_hook):
-                self.assertTrue(hasattr(entry, "communication_hook"))
-                self.assertTrue(hasattr(entry, "communication_hook_state"))
-
-            # Check a correct hook was registered for the root and all submodules if any
-            for entry in FSDP.fsdp_modules(fsdp_model_with_hook):
-                self.assertTrue(
-                    fsdp_model_with_hook.communication_hook,
-                    allreduce_hook.allreduce_hook.__qualname__
-                )
-                self.assertTrue(
-                    fsdp_model_with_hook.communication_hook_state,
-                    allreduce_state
+            with self.assertRaises(AssertionError):
+                fsdp_model_with_hook.register_comm_hook(
+                    dummy_state,
+                    dummy_hook
                 )
 
-            for _ in range(10):
-                optimizer2.zero_grad()
-                out2 = fsdp_model_no_hook(input)
-                loss2 = F.mse_loss(out2, target)
-                loss2.backward()
-                optimizer2.step()
-
-            dist.barrier()
-
-            for _ in range(10):
-                optimizer1.zero_grad()
-                out1 = fsdp_model_with_hook(input)
-                loss1 = F.mse_loss(out1, target)
-                loss1.backward()
-                optimizer1.step()
-
-
-            for orig_param, hook_param in zip(fsdp_model_no_hook.parameters(), fsdp_model_with_hook.parameters()):
-                self.assertEqual(orig_param.grad, hook_param.grad)
+            # Check dummy hook was registered for the root and all submodules if any
+            for entry in FSDP.fsdp_modules(fsdp_model_with_hook):
+                self.assertEqual(
+                    entry.communication_hook.__qualname__,
+                    dummy_hook.__qualname__
+                )
+                self.assertEqual(
+                    entry.communication_hook_state,
+                    dummy_state
+                )
 
 
 instantiate_parametrized_tests(TestCommunicationHooks)
